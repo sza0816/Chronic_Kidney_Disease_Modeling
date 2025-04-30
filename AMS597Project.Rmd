@@ -1,0 +1,894 @@
+---
+title: "AMS597Project"
+author: "Zian Shang, Nicole Dona, Thomas Huang, Tasfia Shaikh"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+## Install + Include packages
+```{r}
+library(mice)
+library(dplyr)
+library(tidyverse)
+library(mlbench)
+library(caret)
+library(e1071)
+library(logistf)
+library(randomForest)
+library(factoextra)
+library(clustMixType)
+library(cluster)
+library(MASS)
+library(ggplot2)
+library(tidyr)
+library(rpart)
+library(rattle)
+library(glmnet)
+```
+
+
+
+## Read data from "chronic_kidney_disease.arff" file
+```{r}
+# change to your own file path
+file_path <- "Chronic_Kidney_Disease/chronic_kidney_disease.arff"
+lines <- readLines(file_path)
+
+
+# get lines after line "@data" all the way to the end
+data_start <- which(grepl("^@data", lines, ignore.case = TRUE)) + 2
+data_lines <- lines[data_start:length(lines)-1]
+
+rm(file_path, data_start, lines)
+```
+
+
+```{r}
+# read data lines as table
+data <- read.table(text = data_lines, 
+                   sep = ",", 
+                   header = FALSE, 
+                   stringsAsFactors = FALSE, 
+                   na.strings = "?")
+
+# rename columns
+colnames(data) <- c("age", "bp", "sg", "al", "su", "rbc", "pc", "pcc", "ba", "bgr",
+                    "bu", "sc", "sod", "pot", "hemo", "pcv", "wbcc", "rbcc", "htn", 
+                    "dm", "cad", "appet", "pe", "ane", "class")
+
+# str(data)
+# dim(data)    400x25
+
+rm(data_lines)
+```
+
+
+
+## Explore columns that might be useful for modeling
+
+```{r}
+# Count number of NA's in each column
+na.sums <- colSums(is.na(data))  # Now check NA counts
+
+# print num of cols that has NA's > 50% of total
+sum(na.sums > (0.5 * nrow(data)))
+
+rm(na.sums)
+
+# All columns have missing values less than 50% of the total data,
+# impute missing values instead. 
+
+# lapply(data, unique)
+```
+
+
+
+## Reformat strings
+```{r}
+data[] <- lapply(data, function(x) { 
+  # for every char col
+  if (is.character(x)){
+    x <- gsub("\\t\\?", NA, x)      # convert "\t?" to NA
+    x <- gsub("^\\t", "", x)        # remove leading "\t" for some strings
+  }
+  return(x)
+})
+
+# dm
+data$dm[data$dm == " yes"] <- "yes"
+
+# ckd
+data$class[data$class == "ckd\t"] <- "ckd"
+
+# check unique values
+# lapply(data, unique)
+```
+
+
+## Check & deal with data types
+```{r}
+print(sapply(data, class))
+
+# Factorize numeric but categorical data
+cols1 <- c("sg", "al", "su")
+# Apply factorization to selected columns using lapply
+data[cols1] <- lapply(data[cols1], as.factor)
+
+cols2 <- c("pcv", "wbcc", "rbcc")
+data[cols2] <- lapply(data[cols2], as.numeric)
+
+rm(cols1, cols2)
+```
+
+
+## Impute numeic data by pmm, categorical data by mode
+```{r}
+# Function to calculate the mode
+get.mode <- function(x) {
+  unique.values <- na.omit(x)
+  mode <- unique.values[which.max(tabulate(match(x, unique.values)))]
+  return(mode)
+}
+```
+
+
+```{r}
+# Function to impute missing values
+impute.data <- function(df) {
+  # Separate numeric and categorical columns
+  num_cols <- names(df)[sapply(df, is.numeric)]
+  cat_cols <- names(df)[sapply(df, function(x) is.character(x) || is.factor(x))]
+
+  # PMM for numeric columns (only if there are missing values)
+  if (any(colSums(is.na(df[num_cols])) > 0)) {
+    set.seed(597)
+    temp <- mice(df[num_cols], method = "pmm", m = 1, maxit = 5, printFlag = FALSE)
+    df[num_cols] <- complete(temp)
+  }
+  
+  # Mode Imputation for categorical columns
+  for (col in cat_cols) {
+    df[[col]][is.na(df[[col]])] <- get.mode(df[[col]])
+  }
+
+  return(df)
+}
+```
+
+
+```{r}
+# Apply the function
+data.imputed <- impute.data(data)
+
+colSums(is.na(data.imputed))
+```
+
+
+## factorize data
+```{r}
+# data with char columns factored
+data.factorize <- data.imputed
+
+# change class values to "1" & "0"
+data.factorize$class <- ifelse(data.factorize$class == "ckd", "1", "0")
+
+
+# factorize char columns
+data.factorize[] <- lapply(data.factorize, function(x){
+  if(is.character(x)){ x <- as.factor(x) }
+  return(x)
+})
+
+# str(data.factorize)
+```
+
+
+## detect & fix outliers
+```{r}
+# function to detect outlier columns
+get_outliers <- function(df) {
+  boxplot_stats <- lapply(df, function(x) {
+    if (is.numeric(x)) boxplot.stats(x)$out else NULL
+  })
+  
+  outlier_cols <- names(boxplot_stats)[sapply(boxplot_stats, function(x) !is.null(x) && length(x) > 0)]
+  return(outlier_cols)
+}
+get_outliers(data.factorize)
+```
+
+
+
+
+```{r}
+# identify skewed columns
+# sapply(data.factorize[outlier_cols], skewness, na.rm = TRUE)
+
+# bp, bgr, bu, sc, pot, wbcc -- skewness > 1, highly skewed
+# age, hemo, pcv, rbcc       --  -1 < skewness < 1
+# sod                        -- skewness <-1, strongly negative skew
+
+skewed.cols <- c("bp", "bgr", "bu", "sc", "pot", "wbcc")
+not.skewed.cols <- c("age", "hemo", "pcv", "rbcc")  # More stable data
+```
+
+
+## transformation for skewed data/extreme values
+```{r}
+# 1. capping for not highly skewed data with extreme values
+
+# "age", "hemo", "pcv", "rbcc" --> solved
+cap_outliers <- function(x) {
+  qnt <- quantile(x, probs = c(0.05, 0.95), na.rm = TRUE)
+  x[x < qnt[1]] <- qnt[1]
+  x[x > qnt[2]] <- qnt[2]
+  return(x)
+}
+data.factorize[not.skewed.cols] <- lapply(data.factorize[not.skewed.cols], cap_outliers)
+
+data.factorize[not.skewed.cols] %>%
+  pivot_longer(everything(), names_to = "variable") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "white") +
+  facet_wrap(~ variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Non-skewed Data After Capping")
+```
+
+
+```{r}
+data.factorize[skewed.cols] %>%
+  pivot_longer(everything(), names_to = "variable") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "white") +
+  facet_wrap(~ variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Skewed Data Before Log Transform")
+
+# -----------------------------------------------------------------------------
+
+# 2. log-transform highly skewed data --> reduce skewness
+
+data.factorize[skewed.cols] <- log1p(data.factorize[skewed.cols])     
+## need to un-log it for k-means
+
+# -----------------------------------------------------------------------------
+
+data.factorize[skewed.cols] %>%
+  pivot_longer(everything(), names_to = "variable") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "white") +
+  facet_wrap(~ variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Skewed Data After Log Transform")
+```
+
+According to the histograms of skewed data after log-transformation above, some outliers may be meaningful, so we will only remove outlier in pot, bu, bgr. 
+
+
+```{r}
+# 2. remove outliers for pot, bu, bgr
+cols <- c("pot", "bu", "bgr")
+
+for (col in cols) {
+  q <- quantile(data.factorize[[col]], probs = c(0.01, 0.99), na.rm = TRUE)
+  data.factorize <- data.factorize[data.factorize[[col]] >= q[1] & data.factorize[[col]] <= q[2], ]
+}
+
+# nrow(data.factorize)     --> 381 rows left
+
+# chcek removal result with plot
+data.factorize[skewed.cols] %>%
+  pivot_longer(everything(), names_to = "variable") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "white") +
+  facet_wrap(~ variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Skewed Data After Outlier Removal")
+
+# -----------------------------------------------------------------------------
+
+# 3. Standardize/scale the numeric columns
+numeric.cols <- sapply(data.factorize, is.numeric)
+scaled_numeric <- scale(data.factorize[, numeric.cols])       
+data.factorize[, numeric.cols] <- scaled_numeric
+
+# record means and sds for k-means clustering
+means <- attr(scaled_numeric, "scaled:center")
+sds <- attr(scaled_numeric, "scaled:scale")
+
+boxplot(data.factorize)
+```
+
+```{r}
+# test outliers again in the end
+get_outliers(data.factorize)
+# meaningful outliers is fine 
+
+rm(not.skewed.cols)
+```
+
+
+
+## Feature selection
+```{r}
+# 1. data as Matrix
+X <- as.matrix(subset(data.factorize, select=-c(class)))
+Y <- data.factorize$class
+
+# -----------------------------------------------------------------------------
+
+# 2. split data
+set.seed(597)
+training.samples <- data.factorize$class %>% createDataPartition(p = 0.8, list = F)
+train.data <- data.factorize[training.samples, ]
+test.data <- data.factorize[-training.samples,]
+
+X_train <- X[training.samples,]
+X_test <- X[-training.samples,]
+y_train <- Y[training.samples]
+y_test <- Y[-training.samples]
+
+# -----------------------------------------------------------------------------
+
+# 3. Variable Selection -> ElasticNet
+# reasons:
+# 1. To remove the variables that have little or no assoication with the target, 
+#    to make it more easy to interpret.
+# 2. If features are highly correlated (e.g., two similar lab tests), ElasticNet 
+#    tends to keep one and remove others.
+
+train.data$class <- factor(ifelse(train.data$class == "1", "ckd", "notckd"), 
+                           levels = c("notckd", "ckd"))
+
+# define cross-validation control
+ctrl <- trainControl(
+  method = "cv", 
+  number = 10, 
+  classProbs = T, 
+  summaryFunction = twoClassSummary,
+  verboseIter = F
+)
+
+set.seed(123)
+
+model <- train(class ~ ., data = train.data, method = "glmnet", 
+               trControl = ctrl, metric = "ROC")
+
+# -----------------------------------------------------------------------------
+
+# 3. get model with best tune
+# model$bestTune -> gives best tune value
+suppressWarnings({
+  model_en <- glmnet( x = X_train, y = y_train, 
+                    alpha = model$bestTune$alpha, 
+                    lambda=model$bestTune$lambda,
+                    family = "binomial")
+
+})
+
+# -----------------------------------------------------------------------------
+
+# get model coefficients
+coef_df <- as.matrix(coef(model_en))
+coef_df <- data.frame(name = rownames(coef_df), coef = coef_df[,1])
+
+# obtain variables to keep 
+selected_vars <- coef_df$name[coef_df$coef != 0 & coef_df$name != "(Intercept)"]
+data.factorize <- data.factorize[, c(selected_vars, "class")]
+
+str(data.factorize)
+
+# update skew.cols
+skewed.cols <- c("bp", "bgr", "bu", "sc", "pot")
+not.skewed.cols <- c("age", "hemo", "pcv", "rbcc") 
+
+rm(X, Y, X_train, X_test, y_train, y_test, ctrl, model, coef_df, selected_vars)
+```
+
+
+
+
+## Research Question 1: 
+
+## Can we predict whether a patient has chronic kidney disease based on clinical and laboratory features?
+
+### 1. logistic model
+```{r}
+# split data
+set.seed(597)
+training.samples <- data.factorize$class %>% createDataPartition(p=0.8, list=F)
+train.data <- data.factorize[training.samples,]
+test.data <- data.factorize[-training.samples,]
+```
+
+
+```{r}
+# fit model
+
+# 1. data does not converge
+# fit.logistic <- glm(class~., train.data, family=binomial) 
+
+# 2. force convergence by controlling the maxit & add class weights
+suppressWarnings({
+set.seed(597)
+fit.logistic <- glm(class ~ ., data = train.data, 
+                               family = binomial, 
+                               weights = ifelse(train.data$class == 1, 1, 10), 
+                               control = glm.control(maxit = 100))
+})
+# extreme 0/1 warning persists, NOT imbalance class problem
+
+
+# 3. try stepwise selection, 0.925 accuracy
+suppressWarnings({
+  set.seed(597)
+fit.logistic <- step(fit.logistic, direction = "both", trace = 0)
+})
+summary(fit.logistic)
+# extreme 0/1 warning
+```
+
+### test logistic model prediction
+```{r}
+set.seed(597)
+# predict
+pred_prob <- fit.logistic %>% predict(test.data, type="response")
+predicted.classes <- ifelse(pred_prob > 0.5, "1", "0")
+
+# confusion matrix
+cm.l <- confusionMatrix(factor(predicted.classes), factor(test.data$class), positive = "1")
+cm.l
+```
+
+### Extract Metrics
+```{r}
+accuracy <- cm.l$overall["Accuracy"]
+sensitivity <- cm.l$byClass["Sensitivity"]
+specificity <- cm.l$byClass["Specificity"]
+
+cat("Accuracy: ", round(accuracy * 100, 2), "%\n")
+cat("Sensitivity: ", round(sensitivity * 100, 2), "%\n")
+cat("Specificity: ", round(specificity * 100, 2), "%\n")
+```
+
+
+#####  Conclusion for logistic model: 
+
+The best-performing logistic regression model achieved a relatively high accuracy after applying maximum iterations (maxit), class weighting, and step-wise variable selection. Despite these adjustments, the warning “glm.fit: fitted probabilities numerically 0 or 1 occurred” persisted, indicating potential issues with extreme values in the dataset. While this warning doesn’t suggest an imbalance in the classes, further investigation into the dataset’s characteristics would be necessary to address this issue, but it remains beyond the scope of the current analysis. Next, we will explore using a random forest model to assess its performance and potential to handle these challenges. 
+
+
+
+### 2. RandomForest
+
+```{r}
+# Train Random Forest
+set.seed(597)
+fit.rf <- randomForest(class ~ ., data = train.data, importance = TRUE, ntree = 500)
+```
+
+
+### Plot variable importance
+```{r}
+varImpPlot(fit.rf, main = "Random Forest Feature Importance for CKD")
+```
+
+### Get importance table
+```{r}
+importance_df <- as.data.frame(fit.rf$importance)
+importance_df <- importance_df[order(importance_df$MeanDecreaseGini, decreasing = TRUE), ]
+print(importance_df)
+
+rm(importance_df)
+```
+
+
+### Predict model & analyze
+```{r}
+# get model predictions
+rf_predictions <- predict(fit.rf, newdata = test.data)
+
+# Create confusion matrix using caret
+cm.f <- confusionMatrix(rf_predictions, test.data$class , positive="1")
+cm.f
+```
+
+
+### Extract Metrics
+```{r}
+accuracy <- cm.f$overall["Accuracy"]
+sensitivity <- cm.f$byClass["Sensitivity"]
+specificity <- cm.f$byClass["Specificity"]
+
+cat("Accuracy: ", round(accuracy * 100, 2), "%\n")
+cat("Sensitivity: ", round(sensitivity * 100, 2), "%\n")
+cat("Specificity: ", round(specificity * 100, 2), "%\n")
+```
+
+logistic:  Accuracy:  98.67 % , Sensitivity:  97.83 % , Specificity:  100 %
+
+#####  Conclusion for randomForest model: 
+
+High accuracy, sensitivity, and specificity, better than logistic model and without warning. Both are good at predicting non-CKD objects.
+
+
+
+
+
+
+
+## Research Question 2: 
+
+## Can we identify distinct subgroups of patients based on their clinical and laboratory features?
+
+
+### Decide the number of clusters, use the elbow method
+```{r}
+wss <- numeric(10)
+for (k in 1:10){
+  set.seed(597)
+  kmeans_result <- kmeans(scaled_numeric, centers=k, nstart=50)
+  wss[k] <- kmeans_result$tot.withinss
+}
+
+plot(1:10, wss, type='b', main='Elbow Method', xlab= '# Of Clusters', 
+     ylab='Total within-cluster Sum of Squares',)
+#### Choose 2 clusters
+
+
+rm(kmeans_result)
+```
+
+### 1. K-means clustering
+```{r}
+set.seed(597)
+km <- kmeans(scaled_numeric, centers=2, nstart=50)
+fviz_cluster(km, data=scaled_numeric, ellipse.type='convex', palette='jco', 
+             ggtheme=theme_minimal(), main='K Means Clustering')
+```
+
+### calculate centroids
+```{r}
+# match column order in sds & means with that of model centers
+sds <- sds[colnames(km$centers)]
+means <- means[colnames(km$centers)]
+
+# get centroids
+centroids <- sweep(km$centers, 2, sds, "*")
+centroids <- sweep(centroids, 2, means, "+")
+# de-log skewed columns
+centroids[ , skewed.cols] <- expm1(centroids[ , skewed.cols]) 
+
+# print centroids in dataframe
+centroids <- round(centroids, 2)
+centroids <- as.data.frame(centroids)
+centroids$Cluster <- paste("Cluster", 1:nrow(centroids))
+centroids <- centroids[, c(ncol(centroids), 1:(ncol(centroids)-1))]
+print(centroids)
+
+# cluster 1 is CKD  -> age around 45
+# cluster 2 is not CKD -> age around 60
+```
+
+```{r}
+# Compare with data before factorization to ensure values make sense
+summary(data.imputed[numeric.cols])     
+# data.imputed is not scaled/outlier_removed/log-trans/factorized
+```
+
+
+### get confusion matrix
+```{r}
+predicted <- ifelse(km$cluster == 2, 1, 0) # 2 = CKD
+# Make factors with same levels
+predicted <- factor(predicted, levels = c(0, 1))
+actual <- factor(data.factorize$class, levels = c(0, 1))
+
+cm.k <- confusionMatrix(data = predicted, reference = actual, positive = "1")
+cm.k
+```
+
+
+### get stats
+```{r}
+accuracy <- cm.k$overall["Accuracy"]
+sensitivity <- cm.k$byClass["Sensitivity"]
+specificity <- cm.k$byClass["Specificity"]
+
+cat("Accuracy: ", round(accuracy * 100, 2), "%\n")
+cat("Sensitivity: ", round(sensitivity * 100, 2), "%\n")
+cat("Specificity: ", round(specificity * 100, 2), "%\n")
+```
+
+##### Conclusion for K-means clustering: 
+
+It is good for predicting healthy patients but not sensitive enough to CKD patients.
+
+
+
+
+### 2. hierarchical clustering
+```{r}
+# remove column class
+df<- subset(data.factorize, select = -class)
+
+# 1. gower distance + clustering
+d <- daisy(df, metric = "gower")
+h <- hclust(d, method = "ward.D")
+cl <- factor(cutree(h, k = 2))
+
+# testing which cluster is CKD
+table(cl, data.factorize$class)
+# cluster 1 -> CKD  -> around 60
+# cluster 2 -> not CKD   -> around 45
+
+
+# temp df to combine data with new cluster column, for looking for centroids
+df <- data.frame(df, cl = cl)
+```
+
+
+### plot dendrogram
+```{r}
+plot(h, main='Hierarchial Clustering Dendogram', cex=0.9)
+```
+this is how we choose k=2.
+
+
+
+### plot clusters
+```{r}
+# Plot using scaled numeric data and your cluster labels
+fviz_cluster(list(data = scaled_numeric, cluster = cl),
+             ellipse.type = "convex",
+             palette = "jco",
+             ggtheme = theme_minimal(),
+             main = "Hierarchical Clustering (ward.D)")
+```
+
+
+### get centroids
+```{r}
+# 2. unscale + de-log numeric columns
+num <- names(df)[sapply(df, is.numeric)]
+cat <- setdiff(names(df), c(num, "cl"))
+
+num_mean <- group_by(df, cl) %>% summarise(across(all_of(num), mean))
+
+x <- as.matrix(num_mean[, -1])
+x <- sweep(x, 2, sds[colnames(x)], "*")
+x <- sweep(x, 2, means[colnames(x)], "+")
+x[, skewed.cols] <- expm1(x[, skewed.cols])         # reverse log1p here
+
+num_mean <- data.frame(cl = num_mean$cl, round(x, 2))
+
+# -----------------------------------------------------------------------------
+
+# 3. summarize categorical data using mode
+get_mode <- function(x) names(which.max(table(x)))
+cat_mode <- group_by(df, cl) %>% summarise(across(all_of(cat), get_mode))
+
+# -----------------------------------------------------------------------------
+
+# 4. combine categorical & numeric centroids
+centroids <- left_join(num_mean, cat_mode, by = "cl")
+centroids
+
+
+# remove temp variables
+rm(d, h, df, num, cat, num_mean, cat_mode)
+```
+
+### relabel centroids
+```{r}
+# notice that centroid orders are flipped, flip them back for better comparison
+centroids$cl <- as.numeric(as.character(centroids$cl))
+centroids$cl <- ifelse(centroids$cl == 1, 2, 1)
+
+# reorder rows by new label
+centroids <- centroids[order(centroids$cl), ]
+rownames(centroids) <- NULL
+centroids
+```
+
+
+### predict ckd or notckd
+```{r}
+# tested cluster 1 -> CKD
+pred <- ifelse(cl == "1", "1", "0")
+pred <- factor(pred, levels = c(0, 1))
+actual <- factor(data.factorize$class, levels = c(0, 1))
+
+cm.h <- confusionMatrix(pred, actual, positive = "1")
+cm.h
+```
+
+
+```{r}
+# hierarchical clustering stats
+accuracy <- cm.h$overall["Accuracy"]
+sensitivity <- cm.h$byClass["Sensitivity"]
+specificity <- cm.h$byClass["Specificity"]
+
+cat("Accuracy: ", round(accuracy * 100, 2), "%\n")
+cat("Sensitivity: ", round(sensitivity * 100, 2), "%\n")
+cat("Specificity: ", round(specificity * 100, 2), "%\n")
+```
+
+
+##### Conclusion for hierarchical clustering: 
+
+Perfect predictions using method "ward.D" for hclust(). 
+
+Other methods:
+
+"ward.D2", gives 87.93% accuracy, 80.26% sensitivity, and 100% specificity.(flip)
+
+"complete", gives 77.17% accuracy, 62.66% sensitivity, and 100% specificity.(not flip)
+
+Overall, the hierarchical clustering is also at predicting non-CKD patients, and it is much more sensitive than k-means in case of CKD patients. 
+
+
+
+
+
+
+## Research Question 3:
+
+## Can chronic kidney disease be accurately predicted when key predictors such as hemoglobin appear normal?
+
+```{r}
+# cart model to check what variables are the most important
+set.seed(597)
+model_CART <- train( class~., data=train.data, method="rpart",
+                      trControl = trainControl("cv",number=10), tuneLength=100)
+
+# plot(model_CART)
+# fancyRpartPlot(model_CART$finalModel)
+
+# get CART model predictions
+pred_CART <- predict(model_CART, newdata = test.data)
+
+# -----------------------------------------------------------------------------
+
+# check importance of each feature
+model_CART$finalModel$variable.importance
+```
+
+
+### According to our research and exploration to the data, obtain new data with: 
+
+### 1. hemo within 12 - 16 
+
+### 2. pcv >= 36, everyone with pcv < 36 has ckd
+
+### 3. sc <= 1.3, everyone with sc > 1.3 has ckd
+
+### 4. rbcc >= 4, rbcc < 4 indicates anemia
+```{r}
+# un-scale important features & get indices of target values
+hemo_z1 <- (12 - means["hemo"]) / sds["hemo"]
+hemo_z2 <- (16 - means["hemo"]) / sds["hemo"]
+sc_z <- (1.3 - means["sc"]) / sds["sc"]
+rbcc_z <- (4 - means["rbcc"]) / sds["rbcc"]
+pcv_z <- (36 - means["pcv"]) / sds["pcv"]
+
+new.data <- subset(data.factorize,
+                   hemo >= hemo_z1 & hemo <= hemo_z2 &
+                   sc <= sc_z &
+                   rbcc >= rbcc_z &
+                   pcv >= pcv_z)
+
+# remove important features
+new.data <- new.data[, !(names(new.data) %in% c("hemo", "pcv", "sc", "rbcc"))]
+
+nrow(new.data)         # 160 data left
+```
+
+
+
+### 1. randomForest
+```{r}
+# split data
+set.seed(597)
+training.samples <- new.data$class %>% createDataPartition(p=0.8, list=F)
+train.data <- new.data[training.samples,]
+test.data <- new.data[-training.samples,]
+```
+
+
+### build model
+```{r}
+set.seed(597)
+fit.rf.new <- randomForest(class ~ ., data = train.data, importance = TRUE, ntree = 500)
+```
+
+
+### Plot variable importance
+```{r}
+varImpPlot(fit.rf.new, main = "Random Forest Feature Importance for CKD")
+```
+
+
+### Get importance table
+```{r}
+importance_df <- as.data.frame(fit.rf.new$importance)
+importance_df <- importance_df[order(importance_df$MeanDecreaseGini, decreasing = TRUE), ]
+print(importance_df)
+
+rm(importance_df)
+```
+
+
+### Predict model & analyze
+```{r}
+# get model predictions
+rf_predictions <- predict(fit.rf.new, newdata = test.data)
+
+# Create confusion matrix using caret
+cm.f <- confusionMatrix(rf_predictions, test.data$class , positive="1")
+cm.f
+```
+
+
+### Extract Metrics
+```{r}
+accuracy <- cm.f$overall["Accuracy"]
+sensitivity <- cm.f$byClass["Sensitivity"]
+specificity <- cm.f$byClass["Specificity"]
+
+cat("Accuracy: ", round(accuracy * 100, 2), "%\n")
+cat("Sensitivity: ", round(sensitivity * 100, 2), "%\n")
+cat("Specificity: ", round(specificity * 100, 2), "%\n")
+```
+
+
+##### Conclusion for RandomForest:
+
+A specificity of 100% indicates that the model is highly effective at correctly identifying non-CKD patients, even more so than its sensitivity of 90.91% for CKD patients. Overall, the model performs well. This suggests that even without the four most important features, the model can still effectively predict whether a patient has CKD or not.
+
+
+
+
+### 2. Decision tree with 10-fold cross-validation and tuning
+```{r}
+set.seed(597)
+fit.cart.new <- train(
+  class ~ ., 
+  data = train.data, 
+  method = "rpart", 
+  trControl = trainControl(method = "cv", number = 10),
+  tuneLength = 20
+)
+
+# Predict
+pred.cart <- predict(fit.cart.new, newdata = test.data)
+cm.c <- confusionMatrix(pred.cart, test.data$class, positive = "1")
+cm.c
+```
+
+### Extract Metrics
+```{r}
+accuracy <- cm.c$overall["Accuracy"]
+sensitivity <- cm.c$byClass["Sensitivity"]
+specificity <- cm.c$byClass["Specificity"]
+
+cat("Accuracy: ", round(accuracy * 100, 2), "%\n")
+cat("Sensitivity: ", round(sensitivity * 100, 2), "%\n")
+cat("Specificity: ", round(specificity * 100, 2), "%\n")
+```
+
+
+```{r}
+rpart.plot::rpart.plot(fit.cart.new$finalModel)
+```
+
+##### Conclusion for tuned CART model: 
+
+Similar to the random forest model, the simpler tuned CART model built using the train() method also performs well in identifying healthy patients while achieving reasonable sensitivity in diagnosing CKD. This suggests that even when the strongest predictors appear normal, early signs of CKD can still be detected from secondary features. 
